@@ -1,0 +1,517 @@
+/**
+ * INFOR ABSEN QR - Backend Google Apps Script
+ * Mata Pelajaran: Informatika (SMPN 2 Cikijing)
+ */
+
+const SHEET_NAMES = {
+  USERS: 'Users',
+  KELAS: 'Kelas',
+  SISWA: 'Siswa',
+  ABSENSI: 'Absensi',
+  MATERI: 'Materi'
+};
+
+function doGet(e) {
+  return HtmlService.createHtmlOutputFromFile('Index')
+    .setTitle('INFOR ABSEN QR - Absensi Informatika')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1.0');
+}
+
+function getSpreadsheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    throw new Error('Spreadsheet aktif tidak ditemukan. Jalankan script ini dari dalam Google Sheets.');
+  }
+  return ss;
+}
+
+/**
+ * Menginisialisasi seluruh sheet dan akun guru default jika belum ada.
+ */
+function setupDatabase() {
+  const ss = getSpreadsheet();
+  const schemas = {
+    [SHEET_NAMES.USERS]: ['ID', 'Username', 'Password', 'Nama_Guru', 'NIP', 'Role'],
+    [SHEET_NAMES.KELAS]: ['ID_Kelas', 'Nama_Kelas', 'Wali_Kelas', 'Tahun_Ajaran'],
+    [SHEET_NAMES.SISWA]: ['NIS', 'Nama_Lengkap', 'Jenis_Kelamin', 'Kelas', 'QR_String'],
+    [SHEET_NAMES.ABSENSI]: ['ID_Absensi', 'Tanggal', 'Jam', 'NIS', 'Nama_Lengkap', 'Kelas', 'Mata_Pelajaran', 'Status', 'Keterangan', 'Sesi_ID'],
+    [SHEET_NAMES.MATERI]: ['ID_Materi', 'Kelas', 'Bab_Topik', 'Deskripsi', 'Link_Materi', 'Tanggal_Upload']
+  };
+
+  Object.keys(schemas).forEach(name => {
+    let sheet = ss.getSheetByName(name);
+    if (!sheet) {
+      sheet = ss.insertSheet(name);
+      sheet.appendRow(schemas[name]);
+      sheet.setFrozenRows(1);
+    } else if (sheet.getLastRow() === 0) {
+      sheet.appendRow(schemas[name]);
+      sheet.setFrozenRows(1);
+    }
+  });
+
+  const userSheet = ss.getSheetByName(SHEET_NAMES.USERS);
+  if (userSheet.getLastRow() === 1) {
+    userSheet.appendRow(['USR-001', 'guru_info', 'info123', 'Guru Informatika', '198501012010011001', 'Admin']);
+  }
+
+  return { success: true, message: 'Database INFOR ABSEN QR berhasil diinisialisasi.' };
+}
+
+function getSheetDataObjects(sheetName) {
+  setupDatabase();
+  const sheet = getSpreadsheet().getSheetByName(sheetName);
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow <= 1) return [];
+
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h).trim());
+  const rows = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+
+  return rows.map((row, idx) => {
+    const obj = { _rowIndex: idx + 2 };
+    headers.forEach((header, colIdx) => {
+      let val = row[colIdx];
+      if (val instanceof Date) {
+        val = Utilities.formatDate(val, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+      }
+      obj[header] = val !== undefined && val !== null ? String(val) : '';
+    });
+    return obj;
+  });
+}
+
+// ==========================================
+// 1. AUTENTIKASI & PENGATURAN AKUN
+// ==========================================
+
+function loginGuru(username, password) {
+  try {
+    const users = getSheetDataObjects(SHEET_NAMES.USERS);
+    const uClean = String(username || '').trim();
+    const pClean = String(password || '').trim();
+
+    const found = users.find(u => u.Username === uClean && u.Password === pClean);
+    if (!found) {
+      return { success: false, message: 'Username atau password guru salah.' };
+    }
+
+    return {
+      success: true,
+      user: {
+        id: found.ID,
+        username: found.Username,
+        namaGuru: found.Nama_Guru,
+        nip: found.NIP,
+        role: found.Role
+      }
+    };
+  } catch (err) {
+    return { success: false, message: 'Terjadi kesalahan login: ' + err.message };
+  }
+}
+
+function updateAkunGuru(payload) {
+  try {
+    setupDatabase();
+    const sheet = getSpreadsheet().getSheetByName(SHEET_NAMES.USERS);
+    const users = getSheetDataObjects(SHEET_NAMES.USERS);
+    const target = users.find(u => u.ID === payload.id);
+
+    if (!target) {
+      return { success: false, message: 'Akun guru tidak ditemukan.' };
+    }
+
+    const row = target._rowIndex;
+    sheet.getRange(row, 2).setValue(String(payload.username).trim());
+    if (payload.password && String(payload.password).trim() !== '') {
+      sheet.getRange(row, 3).setValue(String(payload.password).trim());
+    }
+    sheet.getRange(row, 4).setValue(String(payload.namaGuru).trim());
+    sheet.getRange(row, 5).setValue(String(payload.nip).trim());
+
+    return {
+      success: true,
+      message: 'Pengaturan akun berhasil diperbarui.',
+      user: {
+        id: target.ID,
+        username: String(payload.username).trim(),
+        namaGuru: String(payload.namaGuru).trim(),
+        nip: String(payload.nip).trim(),
+        role: target.Role
+      }
+    };
+  } catch (err) {
+    return { success: false, message: 'Gagal memperbarui akun: ' + err.message };
+  }
+}
+
+// ==========================================
+// 2. DASHBOARD & REKAP DATA UTAMA
+// ==========================================
+
+function getDashboardData(tanggalFilter) {
+  try {
+    const siswa = getSheetDataObjects(SHEET_NAMES.SISWA);
+    const kelas = getSheetDataObjects(SHEET_NAMES.KELAS);
+    const absensi = getSheetDataObjects(SHEET_NAMES.ABSENSI);
+    const materi = getSheetDataObjects(SHEET_NAMES.MATERI);
+
+    const targetDate = tanggalFilter || Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    const absensiHariIni = absensi.filter(a => a.Tanggal === targetDate);
+
+    let hadir = 0, izin = 0, sakit = 0, alfa = 0;
+    absensiHariIni.forEach(item => {
+      const st = String(item.Status).toLowerCase();
+      if (st === 'hadir') hadir++;
+      else if (st === 'izin') izin++;
+      else if (st === 'sakit') sakit++;
+      else if (st === 'alfa') alfa++;
+    });
+
+    const totalSiswa = siswa.length;
+    const persentaseKehadiran = totalSiswa > 0 ? Number(((hadir / totalSiswa) * 100).toFixed(1)) : 0;
+
+    return {
+      success: true,
+      tanggal: targetDate,
+      stats: {
+        totalSiswa,
+        totalKelas: kelas.length,
+        hadir,
+        izin,
+        sakit,
+        alfa,
+        persentaseKehadiran
+      },
+      siswa,
+      kelas,
+      absensi,
+      materi
+    };
+  } catch (err) {
+    return { success: false, message: 'Gagal memuat data: ' + err.message };
+  }
+}
+
+// ==========================================
+// 3. MANAJEMEN DATA KELAS
+// ==========================================
+
+function simpanKelas(data) {
+  try {
+    setupDatabase();
+    const sheet = getSpreadsheet().getSheetByName(SHEET_NAMES.KELAS);
+    const list = getSheetDataObjects(SHEET_NAMES.KELAS);
+
+    if (data.idKelas) {
+      const existing = list.find(k => k.ID_Kelas === data.idKelas);
+      if (!existing) return { success: false, message: 'Data kelas tidak ditemukan.' };
+      const r = existing._rowIndex;
+      sheet.getRange(r, 2).setValue(String(data.namaKelas).trim());
+      sheet.getRange(r, 3).setValue(String(data.waliKelas || '').trim());
+      sheet.getRange(r, 4).setValue(String(data.tahunAjaran || '2026/2027').trim());
+      return { success: true, message: 'Data kelas berhasil diperbarui.' };
+    } else {
+      const newId = 'KLS-' + new Date().getTime().toString().slice(-6);
+      sheet.appendRow([
+        newId,
+        String(data.namaKelas).trim(),
+        String(data.waliKelas || '').trim(),
+        String(data.tahunAjaran || '2026/2027').trim()
+      ]);
+      return { success: true, message: 'Kelas baru berhasil ditambahkan.' };
+    }
+  } catch (err) {
+    return { success: false, message: 'Gagal menyimpan kelas: ' + err.message };
+  }
+}
+
+function hapusKelas(idKelas) {
+  try {
+    const sheet = getSpreadsheet().getSheetByName(SHEET_NAMES.KELAS);
+    const list = getSheetDataObjects(SHEET_NAMES.KELAS);
+    const target = list.find(k => k.ID_Kelas === idKelas);
+    if (!target) return { success: false, message: 'Kelas tidak ditemukan.' };
+    sheet.deleteRow(target._rowIndex);
+    return { success: true, message: 'Data kelas berhasil dihapus.' };
+  } catch (err) {
+    return { success: false, message: 'Gagal menghapus kelas: ' + err.message };
+  }
+}
+
+// ==========================================
+// 4. MANAJEMEN DATA SISWA & IMPORT EXCEL
+// ==========================================
+
+function simpanSiswa(data, isEdit) {
+  try {
+    setupDatabase();
+    const sheet = getSpreadsheet().getSheetByName(SHEET_NAMES.SISWA);
+    const list = getSheetDataObjects(SHEET_NAMES.SISWA);
+    const nisClean = String(data.nis || '').trim();
+    const namaClean = String(data.namaLengkap || '').trim();
+    const jkClean = String(data.jenisKelamin || 'L').trim();
+    const kelasClean = String(data.kelas || '').trim();
+
+    if (!nisClean || !namaClean || !kelasClean) {
+      return { success: false, message: 'NIS, Nama Lengkap, dan Kelas wajib diisi.' };
+    }
+
+    const qrString = 'INFORQR-' + nisClean;
+
+    if (isEdit) {
+      const existing = list.find(s => String(s.NIS).trim() === nisClean);
+      if (!existing) return { success: false, message: 'Siswa dengan NIS tersebut tidak ditemukan.' };
+      const r = existing._rowIndex;
+      sheet.getRange(r, 2).setValue(namaClean);
+      sheet.getRange(r, 3).setValue(jkClean);
+      sheet.getRange(r, 4).setValue(kelasClean);
+      sheet.getRange(r, 5).setValue(qrString);
+      return { success: true, message: 'Data siswa berhasil diperbarui.' };
+    } else {
+      const duplicate = list.find(s => String(s.NIS).trim() === nisClean);
+      if (duplicate) {
+        return { success: false, message: 'NIS ' + nisClean + ' sudah terdaftar.' };
+      }
+      sheet.appendRow([nisClean, namaClean, jkClean, kelasClean, qrString]);
+      return { success: true, message: 'Siswa berhasil ditambahkan beserta QR Code unik.' };
+    }
+  } catch (err) {
+    return { success: false, message: 'Gagal menyimpan siswa: ' + err.message };
+  }
+}
+
+function hapusSiswa(nis) {
+  try {
+    const sheet = getSpreadsheet().getSheetByName(SHEET_NAMES.SISWA);
+    const list = getSheetDataObjects(SHEET_NAMES.SISWA);
+    const target = list.find(s => String(s.NIS).trim() === String(nis).trim());
+    if (!target) return { success: false, message: 'Data siswa tidak ditemukan.' };
+    sheet.deleteRow(target._rowIndex);
+    return { success: true, message: 'Data siswa berhasil dihapus.' };
+  } catch (err) {
+    return { success: false, message: 'Gagal menghapus siswa: ' + err.message };
+  }
+}
+
+function importSiswaBulk(rowsArray) {
+  try {
+    setupDatabase();
+    const sheet = getSpreadsheet().getSheetByName(SHEET_NAMES.SISWA);
+    const existingList = getSheetDataObjects(SHEET_NAMES.SISWA);
+    const existingNisSet = new Set(existingList.map(s => String(s.NIS).trim()));
+
+    let addedCount = 0;
+    let skippedCount = 0;
+
+    rowsArray.forEach(item => {
+      const nis = String(item.nis || '').trim();
+      const nama = String(item.namaLengkap || '').trim();
+      const jk = String(item.jenisKelamin || 'L').toUpperCase() === 'P' ? 'P' : 'L';
+      const kelas = String(item.kelas || '').trim();
+
+      if (!nis || !nama || !kelas) {
+        skippedCount++;
+        return;
+      }
+      if (existingNisSet.has(nis)) {
+        skippedCount++;
+        return;
+      }
+
+      sheet.appendRow([nis, nama, jk, kelas, 'INFORQR-' + nis]);
+      existingNisSet.add(nis);
+      addedCount++;
+    });
+
+    return {
+      success: true,
+      message: `Import selesai: ${addedCount} siswa ditambahkan, ${skippedCount} dilewati (duplikat/tidak lengkap).`
+    };
+  } catch (err) {
+    return { success: false, message: 'Gagal mengimpor data siswa: ' + err.message };
+  }
+}
+
+// ==========================================
+// 5. ABSENSI QR CODE & STATUS MANUAL
+// ==========================================
+
+function catatAbsensiQR(payload) {
+  try {
+    setupDatabase();
+    const sheet = getSpreadsheet().getSheetByName(SHEET_NAMES.ABSENSI);
+    const siswaList = getSheetDataObjects(SHEET_NAMES.SISWA);
+    const absensiList = getSheetDataObjects(SHEET_NAMES.ABSENSI);
+
+    const rawCode = String(payload.qrCode || '').trim();
+    const nisFromQr = rawCode.startsWith('INFORQR-') ? rawCode.replace('INFORQR-', '').trim() : rawCode;
+
+    const siswa = siswaList.find(
+      s => String(s.QR_String).trim() === rawCode || String(s.NIS).trim() === nisFromQr
+    );
+
+    if (!siswa) {
+      return { success: false, statusCode: 'INVALID_QR', message: 'QR Code tidak terdaftar di database siswa.' };
+    }
+
+    if (payload.kelasSesi && String(siswa.Kelas).trim() !== String(payload.kelasSesi).trim()) {
+      return {
+        success: false,
+        statusCode: 'WRONG_CLASS',
+        message: `${siswa.Nama_Lengkap} terdaftar di kelas ${siswa.Kelas}, bukan ${payload.kelasSesi}.`
+      };
+    }
+
+    const now = new Date();
+    const tanggal = Utilities.formatDate(now, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    const jam = Utilities.formatDate(now, Session.getScriptTimeZone(), 'HH:mm:ss');
+    const sesiId = String(payload.sesiId || tanggal);
+    const mapel = String(payload.mataPelajaran || 'Informatika').trim();
+
+    const sudahAbsen = absensiList.find(
+      a => String(a.NIS).trim() === String(siswa.NIS).trim() &&
+           String(a.Tanggal).trim() === tanggal &&
+           String(a.Sesi_ID).trim() === sesiId
+    );
+
+    if (sudahAbsen) {
+      return {
+        success: false,
+        statusCode: 'DUPLICATE',
+        message: `${siswa.Nama_Lengkap} (${siswa.NIS}) sudah absen pada sesi ini.`
+      };
+    }
+
+    const idAbsensi = 'ABS-' + now.getTime();
+    sheet.appendRow([
+      idAbsensi,
+      tanggal,
+      jam,
+      siswa.NIS,
+      siswa.Nama_Lengkap,
+      siswa.Kelas,
+      mapel,
+      'Hadir',
+      'Scan QR Code',
+      sesiId
+    ]);
+
+    return {
+      success: true,
+      message: `Absensi berhasil: ${siswa.Nama_Lengkap} (${siswa.Kelas}) - HADIR`,
+      record: {
+        ID_Absensi: idAbsensi,
+        Tanggal: tanggal,
+        Jam: jam,
+        NIS: siswa.NIS,
+        Nama_Lengkap: siswa.Nama_Lengkap,
+        Kelas: siswa.Kelas,
+        Mata_Pelajaran: mapel,
+        Status: 'Hadir',
+        Keterangan: 'Scan QR Code',
+        Sesi_ID: sesiId
+      }
+    };
+  } catch (err) {
+    return { success: false, message: 'Gagal memproses absensi QR: ' + err.message };
+  }
+}
+
+function simpanStatusManual(payload) {
+  try {
+    setupDatabase();
+    const sheet = getSpreadsheet().getSheetByName(SHEET_NAMES.ABSENSI);
+    const absensiList = getSheetDataObjects(SHEET_NAMES.ABSENSI);
+    const siswaList = getSheetDataObjects(SHEET_NAMES.SISWA);
+
+    const statusValid = ['Hadir', 'Izin', 'Sakit', 'Alfa'];
+    const statusClean = statusValid.includes(payload.status) ? payload.status : 'Hadir';
+    const ketClean = String(payload.keterangan || '').trim();
+
+    if (payload.idAbsensi) {
+      const target = absensiList.find(a => a.ID_Absensi === payload.idAbsensi);
+      if (!target) return { success: false, message: 'Data absensi tidak ditemukan.' };
+      const r = target._rowIndex;
+      sheet.getRange(r, 8).setValue(statusClean);
+      sheet.getRange(r, 9).setValue(ketClean);
+      return { success: true, message: 'Status kehadiran berhasil diperbarui.' };
+    } else {
+      const siswa = siswaList.find(s => String(s.NIS).trim() === String(payload.nis).trim());
+      if (!siswa) return { success: false, message: 'Siswa tidak ditemukan.' };
+
+      const now = new Date();
+      const tanggal = payload.tanggal || Utilities.formatDate(now, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+      const jam = Utilities.formatDate(now, Session.getScriptTimeZone(), 'HH:mm:ss');
+      const idAbsensi = 'ABS-' + now.getTime();
+
+      sheet.appendRow([
+        idAbsensi,
+        tanggal,
+        jam,
+        siswa.NIS,
+        siswa.Nama_Lengkap,
+        siswa.Kelas,
+        payload.mataPelajaran || 'Informatika',
+        statusClean,
+        ketClean || 'Input manual guru',
+        payload.sesiId || tanggal
+      ]);
+      return { success: true, message: 'Status kehadiran manual berhasil disimpan.' };
+    }
+  } catch (err) {
+    return { success: false, message: 'Gagal menyimpan status manual: ' + err.message };
+  }
+}
+
+// ==========================================
+// 6. MATERI INFORMATIKA
+// ==========================================
+
+function simpanMateri(data) {
+  try {
+    setupDatabase();
+    const sheet = getSpreadsheet().getSheetByName(SHEET_NAMES.MATERI);
+    const list = getSheetDataObjects(SHEET_NAMES.MATERI);
+    const today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+
+    if (data.idMateri) {
+      const target = list.find(m => m.ID_Materi === data.idMateri);
+      if (!target) return { success: false, message: 'Materi tidak ditemukan.' };
+      const r = target._rowIndex;
+      sheet.getRange(r, 2).setValue(String(data.kelas).trim());
+      sheet.getRange(r, 3).setValue(String(data.babTopik).trim());
+      sheet.getRange(r, 4).setValue(String(data.deskripsi || '').trim());
+      sheet.getRange(r, 5).setValue(String(data.linkMateri || '').trim());
+      return { success: true, message: 'Materi Informatika berhasil diperbarui.' };
+    } else {
+      const newId = 'MAT-' + new Date().getTime().toString().slice(-6);
+      sheet.appendRow([
+        newId,
+        String(data.kelas).trim(),
+        String(data.babTopik).trim(),
+        String(data.deskripsi || '').trim(),
+        String(data.linkMateri || '').trim(),
+        today
+      ]);
+      return { success: true, message: 'Materi Informatika berhasil ditambahkan.' };
+    }
+  } catch (err) {
+    return { success: false, message: 'Gagal menyimpan materi: ' + err.message };
+  }
+}
+
+function hapusMateri(idMateri) {
+  try {
+    const sheet = getSpreadsheet().getSheetByName(SHEET_NAMES.MATERI);
+    const list = getSheetDataObjects(SHEET_NAMES.MATERI);
+    const target = list.find(m => m.ID_Materi === idMateri);
+    if (!target) return { success: false, message: 'Materi tidak ditemukan.' };
+    sheet.deleteRow(target._rowIndex);
+    return { success: true, message: 'Materi berhasil dihapus.' };
+  } catch (err) {
+    return { success: false, message: 'Gagal menghapus materi: ' + err.message };
+  }
+}
